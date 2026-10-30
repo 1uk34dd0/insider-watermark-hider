@@ -2,7 +2,7 @@
 // @id              insider-watermark-hider
 // @name            Insider Watermark Hider
 // @description     Hides the "Evaluation copy / Insider Preview" build watermark on the desktop
-// @version         1.0
+// @version         1.1
 // @author          1uk34dd0
 // @github          https://github.com/1uk34dd0
 // @include         explorer.exe
@@ -19,21 +19,25 @@ that Windows Insider builds draw in the bottom-right corner of the desktop.
 
 ## How it works
 
-The mod runs inside `explorer.exe` and intercepts the text-drawing calls
+The mod runs inside `explorer.exe` and hooks the text-drawing functions
 (`DrawTextW`, `DrawTextExW`, `ExtTextOutW`, `TextOutW` and `DrawThemeTextEx`).
-Any call whose text contains "Evaluation copy" or "Insider Preview" is skipped,
-so the watermark is never painted. No system files or registry settings are
-modified, and disabling the mod brings the watermark back.
+A draw call is skipped only when both of these are true:
+
+1. the text contains "Evaluation copy" or "Insider Preview", and
+2. the call comes from `shell32.dll`, which is where the desktop watermark is painted.
+
+Desktop icon labels, File Explorer windows and other text are drawn by other
+components, so a file or folder with one of those phrases in its name keeps its label.
 
 ## Notes
 
+- The text match is English only. On other display languages the watermark text
+  is translated and will not be matched.
 - If the watermark is still visible after enabling the mod, restart Windows
   Explorer (Task Manager -> Windows Explorer -> Restart) so the desktop repaints.
-- The text matching is deliberately narrow, so normal Explorer text such as
-  file names is not affected.
 - Microsoft may change how the watermark is drawn in a future Insider build,
   which could stop this mod from working.
-- Tested on: Windows 11 Insider build 29648.1000
+- Tested on: Windows 11 Insider build <<< YOUR BUILD NUMBER >>>.
 */
 // ==/WindhawkModReadme==
 
@@ -44,7 +48,8 @@ modified, and disabling the mod brings the watermark back.
 // Set to 1 to also log anything containing "Build" or "Windows" (noisy, for diagnosis only)
 #define VERBOSE 0
 
-static bool Inspect(const wchar_t* api, LPCWSTR text, int count) {
+// `caller` is the return address of the hooked call, used to tell which module is drawing.
+static bool Inspect(const wchar_t* api, LPCWSTR text, int count, void* caller) {
     if (!text || count == 0) return false;
 
     wchar_t buf[512];
@@ -55,8 +60,20 @@ static bool Inspect(const wchar_t* api, LPCWSTR text, int count) {
     buf[n] = 0;
 
     if (StrStrIW(buf, L"Evaluation copy") || StrStrIW(buf, L"Insider Preview")) {
-        Wh_Log(L"HIDE %ls: %ls", api, buf);
-        return true;
+        // Only the text matched so far; now check who is drawing it.
+        HMODULE mod = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)caller, &mod);
+        bool fromShell32 = mod && mod == GetModuleHandleW(L"shell32.dll");
+
+        wchar_t path[MAX_PATH] = L"?";
+        if (mod) GetModuleFileNameW(mod, path, MAX_PATH);
+        const wchar_t* name = wcsrchr(path, L'\\');
+        name = name ? name + 1 : path;
+
+        Wh_Log(L"%ls %ls (caller: %ls): %ls", fromShell32 ? L"HIDE" : L"SKIP", api, name, buf);
+        return fromShell32;
     }
 #if VERBOSE
     if (StrStrIW(buf, L"Build") || StrStrIW(buf, L"Windows")) {
@@ -66,11 +83,12 @@ static bool Inspect(const wchar_t* api, LPCWSTR text, int count) {
     return false;
 }
 
-// DrawTextW
+// DrawTextW (measurement-only DT_CALCRECT calls are always passed through)
 typedef int (WINAPI *DrawTextW_t)(HDC, LPCWSTR, int, LPRECT, UINT);
 DrawTextW_t DrawTextW_Original;
 int WINAPI DrawTextW_Hook(HDC hdc, LPCWSTR text, int cch, LPRECT rc, UINT fmt) {
-    if (Inspect(L"DrawTextW", text, cch)) return 0;
+    void* caller = __builtin_return_address(0);
+    if (!(fmt & DT_CALCRECT) && Inspect(L"DrawTextW", text, cch, caller)) return 0;
     return DrawTextW_Original(hdc, text, cch, rc, fmt);
 }
 
@@ -78,7 +96,8 @@ int WINAPI DrawTextW_Hook(HDC hdc, LPCWSTR text, int cch, LPRECT rc, UINT fmt) {
 typedef int (WINAPI *DrawTextExW_t)(HDC, LPWSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS);
 DrawTextExW_t DrawTextExW_Original;
 int WINAPI DrawTextExW_Hook(HDC hdc, LPWSTR text, int cch, LPRECT rc, UINT fmt, LPDRAWTEXTPARAMS p) {
-    if (Inspect(L"DrawTextExW", text, cch)) return 0;
+    void* caller = __builtin_return_address(0);
+    if (!(fmt & DT_CALCRECT) && Inspect(L"DrawTextExW", text, cch, caller)) return 0;
     return DrawTextExW_Original(hdc, text, cch, rc, fmt, p);
 }
 
@@ -86,7 +105,8 @@ int WINAPI DrawTextExW_Hook(HDC hdc, LPWSTR text, int cch, LPRECT rc, UINT fmt, 
 typedef BOOL (WINAPI *ExtTextOutW_t)(HDC, int, int, UINT, const RECT*, LPCWSTR, UINT, const INT*);
 ExtTextOutW_t ExtTextOutW_Original;
 BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT opt, const RECT* rc, LPCWSTR text, UINT cch, const INT* dx) {
-    if (!(opt & ETO_GLYPH_INDEX) && Inspect(L"ExtTextOutW", text, (int)cch)) return TRUE;
+    void* caller = __builtin_return_address(0);
+    if (!(opt & ETO_GLYPH_INDEX) && Inspect(L"ExtTextOutW", text, (int)cch, caller)) return TRUE;
     return ExtTextOutW_Original(hdc, x, y, opt, rc, text, cch, dx);
 }
 
@@ -94,7 +114,8 @@ BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT opt, const RECT* rc, LP
 typedef BOOL (WINAPI *TextOutW_t)(HDC, int, int, LPCWSTR, int);
 TextOutW_t TextOutW_Original;
 BOOL WINAPI TextOutW_Hook(HDC hdc, int x, int y, LPCWSTR text, int cch) {
-    if (Inspect(L"TextOutW", text, cch)) return TRUE;
+    void* caller = __builtin_return_address(0);
+    if (Inspect(L"TextOutW", text, cch, caller)) return TRUE;
     return TextOutW_Original(hdc, x, y, text, cch);
 }
 
@@ -102,7 +123,8 @@ BOOL WINAPI TextOutW_Hook(HDC hdc, int x, int y, LPCWSTR text, int cch) {
 typedef HRESULT (WINAPI *DrawThemeTextEx_t)(HTHEME, HDC, int, int, LPCWSTR, int, DWORD, LPRECT, const DTTOPTS*);
 DrawThemeTextEx_t DrawThemeTextEx_Original;
 HRESULT WINAPI DrawThemeTextEx_Hook(HTHEME th, HDC hdc, int part, int state, LPCWSTR text, int cch, DWORD flags, LPRECT rc, const DTTOPTS* opts) {
-    if (Inspect(L"DrawThemeTextEx", text, cch)) return S_OK;
+    void* caller = __builtin_return_address(0);
+    if (Inspect(L"DrawThemeTextEx", text, cch, caller)) return S_OK;
     return DrawThemeTextEx_Original(th, hdc, part, state, text, cch, flags, rc, opts);
 }
 
