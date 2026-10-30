@@ -2,13 +2,14 @@
 // @id              insider-watermark-hider
 // @name            Insider Watermark Hider
 // @description     Hides the "Evaluation copy / Insider Preview" build watermark on the desktop
-// @version         1.1
+// @version         1.2
 // @author          1uk34dd0
 // @github          https://github.com/1uk34dd0
 // @include         explorer.exe
 // @compilerOptions -luser32 -lgdi32 -luxtheme -lshlwapi
 // @license         MIT
 // ==/WindhawkMod==
+
 
 // ==WindhawkModReadme==
 /*
@@ -21,18 +22,20 @@ that Windows Insider builds draw in the bottom-right corner of the desktop.
 
 The mod runs inside `explorer.exe` and hooks the text-drawing functions
 (`DrawTextW`, `DrawTextExW`, `ExtTextOutW`, `TextOutW` and `DrawThemeTextEx`).
-A draw call is skipped only when both of these are true:
+A draw call is skipped when both of these are true:
 
 1. the text contains "Evaluation copy" or "Insider Preview", and
-2. the call comes from `shell32.dll`, which is where the desktop watermark is painted.
+2. the call does not come from `comctl32.dll`, `dui70.dll` or `ExplorerFrame.dll`,
+   the modules that draw desktop icon labels and File Explorer lists.
 
-Desktop icon labels, File Explorer windows and other text are drawn by other
-components, so a file or folder with one of those phrases in its name keeps its label.
+Measurement-only calls (`DT_CALCRECT`) are never suppressed.
 
 ## Notes
 
 - The text match is English only. On other display languages the watermark text
   is translated and will not be matched.
+- Every phrase match is logged as `HIDE` or `SKIP` together with the name of the
+  module that drew it, which helps diagnose problems on new builds.
 - If the watermark is still visible after enabling the mod, restart Windows
   Explorer (Task Manager -> Windows Explorer -> Restart) so the desktop repaints.
 - Microsoft may change how the watermark is drawn in a future Insider build,
@@ -48,6 +51,17 @@ components, so a file or folder with one of those phrases in its name keeps its 
 // Set to 1 to also log anything containing "Build" or "Windows" (noisy, for diagnosis only)
 #define VERBOSE 0
 
+// Modules that draw desktop icon labels and File Explorer lists; their text is never hidden.
+static bool IsExcludedCaller(const wchar_t* name) {
+    static const wchar_t* const excluded[] = {
+        L"comctl32.dll", L"dui70.dll", L"ExplorerFrame.dll"
+    };
+    for (const wchar_t* e : excluded) {
+        if (_wcsicmp(name, e) == 0) return true;
+    }
+    return false;
+}
+
 // `caller` is the return address of the hooked call, used to tell which module is drawing.
 static bool Inspect(const wchar_t* api, LPCWSTR text, int count, void* caller) {
     if (!text || count == 0) return false;
@@ -60,20 +74,19 @@ static bool Inspect(const wchar_t* api, LPCWSTR text, int count, void* caller) {
     buf[n] = 0;
 
     if (StrStrIW(buf, L"Evaluation copy") || StrStrIW(buf, L"Insider Preview")) {
-        // Only the text matched so far; now check who is drawing it.
         HMODULE mod = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCWSTR)caller, &mod);
-        bool fromShell32 = mod && mod == GetModuleHandleW(L"shell32.dll");
 
-        wchar_t path[MAX_PATH] = L"?";
+        wchar_t path[MAX_PATH] = L"";
         if (mod) GetModuleFileNameW(mod, path, MAX_PATH);
         const wchar_t* name = wcsrchr(path, L'\\');
         name = name ? name + 1 : path;
 
-        Wh_Log(L"%ls %ls (caller: %ls): %ls", fromShell32 ? L"HIDE" : L"SKIP", api, name, buf);
-        return fromShell32;
+        bool hide = !IsExcludedCaller(name);
+        Wh_Log(L"%ls %ls (caller: %ls): %ls", hide ? L"HIDE" : L"SKIP", api, name, buf);
+        return hide;
     }
 #if VERBOSE
     if (StrStrIW(buf, L"Build") || StrStrIW(buf, L"Windows")) {
